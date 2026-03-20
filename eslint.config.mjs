@@ -35,6 +35,7 @@ export default [
       '.github/build/*.js',
       'default-assets-package/thirdparty/**/*.js',
       'dist/**/*.js',
+      'dist/**/*.cjs',
       'dist/**/*.mjs',
       'dist/**/*.d.ts',
       '.environment/validate.js',

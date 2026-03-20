@@ -446,7 +446,7 @@ export class EntraApplication implements IEntraApplicationTokens {
   }
 
   getConfidentialClient(authority: string) {
-    const { insights } = this.providers;
+    const { genericInsights: insights } = this.providers;
     let client: ConfidentialClientApplication = this._confidentialClientByAuthority.get(authority);
     if (!client) {
       const nodeSystemOptions = {
@@ -493,7 +493,7 @@ export class EntraApplication implements IEntraApplicationTokens {
   }
 
   async getDetailedAccessToken(resource: string): Promise<TokenWithDetails> {
-    const { insights } = this.providers;
+    const { genericInsights: insights } = this.providers;
     try {
       if (resource?.startsWith('[azure-cli:')) {
         throw CreateError.InvalidParameters(
