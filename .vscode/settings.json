@@ -2,6 +2,7 @@
   "typescript.tsdk": "node_modules/typescript/lib",
   "chat.tools.terminal.autoApprove": {
     "npm install": true,
-    "npx tsc": true
+    "npx tsc": true,
+    "npx vitest": true
   }
 }

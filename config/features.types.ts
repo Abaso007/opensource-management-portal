@@ -19,4 +19,5 @@ export type ConfigFeatures = {
   allowApiClient: boolean;
   exposeWebhookIngestionEndpoint: boolean;
   allowFossFundElections: boolean;
+  allowSessionFeatureFlags: boolean;
 };

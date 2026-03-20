@@ -3,18 +3,27 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 //
 
-import { Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { URL, fileURLToPath, pathToFileURL } from 'url';
 import zlib from 'zlib';
 
-import { CreateError, getProviders } from './transitional.js';
+import type { Response, Request } from 'express';
+
+import { CreateError } from './transitional.js';
 
 import type { Repository } from '../business/repository.js';
 import type { ReposAppRequest, IAppSession, IReposError, SiteConfiguration } from '../interfaces/index.js';
 
 const isWindows = process.platform === 'win32';
+
+export function isApiRequest(req: ReposAppRequest | Request): boolean {
+  return !!(
+    req.url?.startsWith('/api/') || // even in the browser we respond to API endpoints with JSON
+    (req as ReposAppRequest).apiContext ||
+    (req.headers?.accept && req.headers.accept.includes('application/json'))
+  );
+}
 
 export function daysInMilliseconds(days: number): number {
   return 1000 * 60 * 60 * 24 * days;
@@ -38,6 +47,17 @@ export function importPathSchemeChangeIfWindows(npmName: string) {
 
 export function dateToDateString(date: Date) {
   return date.toISOString().substr(0, 10);
+}
+
+export function stringParam(req: { params: Record<string, string | string[]> }, name: string): string {
+  const value = req.params[name];
+  if (Array.isArray(value)) {
+    if (value.length !== 1) {
+      throw new Error(`Expected a single string value for param "${name}", got ${value.length} values`);
+    }
+    return value[0];
+  }
+  return value ?? '';
 }
 
 export function stringOrNumberAsString(value: any) {
@@ -84,6 +104,45 @@ export function safeLocalRedirectUrl(path: string) {
   return url.search ? `${url.pathname}${url.search}` : url.pathname;
 }
 
+function getRequestOrigin(req: ReposAppRequest): string | undefined {
+  const forwardedHost = req.headers?.['x-forwarded-host'];
+  const hostHeader = Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost || req.headers?.host;
+  if (!hostHeader) {
+    return;
+  }
+  const forwardedProto = req.headers?.['x-forwarded-proto'];
+  const protocol = Array.isArray(forwardedProto)
+    ? forwardedProto[0]
+    : forwardedProto || req.protocol || 'http';
+  return `${protocol}://${hostHeader}`;
+}
+
+function getSafeSessionReferer(req: ReposAppRequest): string | undefined {
+  const rawReferer = req.headers?.referer;
+  if (!rawReferer || rawReferer.includes('/signout')) {
+    return;
+  }
+
+  let refererUrl: URL;
+  try {
+    refererUrl = new URL(rawReferer);
+  } catch {
+    return safeLocalRedirectUrl(rawReferer);
+  }
+
+  const requestOrigin = getRequestOrigin(req);
+  if (requestOrigin) {
+    if (refererUrl.origin !== requestOrigin) {
+      return;
+    }
+    return refererUrl.search ? `${refererUrl.pathname}${refererUrl.search}` : refererUrl.pathname;
+  }
+
+  if (refererUrl.hostname === 'localhost' || refererUrl.hostname === '127.0.0.1') {
+    return rawReferer;
+  }
+}
+
 // Session utility: Store the referral URL, if present, and redirect to a new
 // location.
 interface IStoreReferrerEventDetails {
@@ -94,22 +153,16 @@ interface IStoreReferrerEventDetails {
 }
 
 export function storeReferrer(req: ReposAppRequest, res, redirect, optionalReason) {
-  const { insights } = getProviders(req);
+  const { insights } = req;
   const eventDetails: IStoreReferrerEventDetails = {
     method: 'storeReferrer',
     reason: optionalReason || 'unknown reason',
   };
   const session = req.session as IAppSession;
-  if (
-    session &&
-    req.headers &&
-    req.headers.referer &&
-    session.referer !== undefined &&
-    !req.headers.referer.includes('/signout') &&
-    !session.referer
-  ) {
-    session.referer = req.headers.referer;
-    eventDetails.referer = req.headers.referer;
+  const safeReferer = getSafeSessionReferer(req);
+  if (session && safeReferer && !session.referer) {
+    session.referer = safeReferer;
+    eventDetails.referer = safeReferer;
   } else {
     eventDetails.referer = 'no referer';
   }
@@ -415,4 +468,98 @@ export function stripIso8601Microseconds(value: string) {
 export function fromIso8601DateToUnderscoredWithTime(value: Date | string) {
   value = fromIso8601DateToUnderscored(value);
   return stripIso8601Microseconds(value);
+}
+
+// Only headers in this set are preserved when scrubbing error objects for
+// logging. Every other header (Authorization, Cookie, custom secrets, etc.)
+// is removed automatically so new sensitive headers cannot leak.
+const ALLOWED_LOG_HEADERS = new Set([
+  'content-type',
+  'content-length',
+  'etag',
+  'last-modified',
+  'link',
+  'retry-after',
+  'x-github-request-id',
+  'x-ratelimit-limit',
+  'x-ratelimit-remaining',
+  'x-ratelimit-reset',
+  'x-ratelimit-resource',
+  'x-ratelimit-used',
+  'www-authenticate',
+  'error-description',
+  'av',
+  'x-github-sso',
+  'subject-token-claim-aud',
+  'subject-token-claim-exp',
+  'subject-token-claim-appid',
+  'subject-token-claim-oid',
+  'subject-token-claim-tid',
+]);
+
+export function scrubErrorForLogging(error: unknown): unknown {
+  return scrubErrorRecursive(error, new WeakSet());
+}
+
+function scrubErrorRecursive(error: unknown, seen: WeakSet<object>): unknown {
+  if (!error || typeof error !== 'object') {
+    return error;
+  }
+  if (seen.has(error as object)) {
+    return error;
+  }
+  seen.add(error as object);
+  const axiosLike = error as {
+    config?: { headers?: Record<string, unknown> };
+    request?: { headers?: Record<string, unknown>; _header?: string };
+    response?: { request?: { headers?: Record<string, unknown>; _header?: string } };
+  };
+  filterToAllowedHeaders(axiosLike?.config?.headers);
+  filterToAllowedHeaders(axiosLike?.request?.headers);
+  if (typeof axiosLike?.request?._header === 'string') {
+    axiosLike.request._header = filterHeaderString(axiosLike.request._header);
+  }
+  filterToAllowedHeaders(axiosLike?.response?.request?.headers);
+  if (typeof axiosLike?.response?.request?._header === 'string') {
+    axiosLike.response.request._header = filterHeaderString(axiosLike.response.request._header);
+  }
+  // Recursively scrub wrapped errors (innerError, cause, AggregateError.errors)
+  const errorRecord = error as Record<string, unknown>;
+  if (errorRecord.innerError) {
+    scrubErrorRecursive(errorRecord.innerError, seen);
+  }
+  if (errorRecord.cause) {
+    scrubErrorRecursive(errorRecord.cause, seen);
+  }
+  if (Array.isArray(errorRecord.errors)) {
+    for (const nested of errorRecord.errors) {
+      scrubErrorRecursive(nested, seen);
+    }
+  }
+  return error;
+}
+
+function filterToAllowedHeaders(headers: Record<string, unknown> | undefined): void {
+  if (!headers || typeof headers !== 'object') {
+    return;
+  }
+  for (const key of Object.keys(headers)) {
+    if (!ALLOWED_LOG_HEADERS.has(key.toLowerCase())) {
+      delete headers[key];
+    }
+  }
+}
+
+function filterHeaderString(raw: string): string {
+  return raw
+    .split('\r\n')
+    .filter((line) => {
+      const colonIndex = line.indexOf(':');
+      if (colonIndex === -1) {
+        return true;
+      }
+      const name = line.substring(0, colonIndex).trim().toLowerCase();
+      return ALLOWED_LOG_HEADERS.has(name);
+    })
+    .join('\r\n');
 }
